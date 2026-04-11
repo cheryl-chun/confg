@@ -12,7 +12,6 @@ const singletonTemplate = `
 import (
 	"sync"
 
-	"github.com/cheryl-chun/confgen/internal/tree"
 	"github.com/cheryl-chun/confgen/runtime"
 )
 
@@ -83,6 +82,22 @@ func WithEnv(prefix string) Option {
 
 // dynamicMethodsTemplate 动态查询方法模板
 const dynamicMethodsTemplate = `
+// Set 动态设置配置值（自动推断值类型）
+func (c *{{.RootStructName}}) Set(path string, value interface{}, source runtime.SourceType) error {
+	if c.ConfigTree == nil {
+		return nil
+	}
+	return c.ConfigTree.Set(path, value, source)
+}
+
+// Watch 监听指定 path 的值变化
+func (c *{{.RootStructName}}) Watch(path string, callback runtime.WatchCallback) func() {
+	if c.ConfigTree == nil {
+		return func() {}
+	}
+	return c.ConfigTree.Watch(path, callback)
+}
+
 // GetString 动态查询字符串值
 //
 // 示例: cfg.GetString("server.host")
@@ -90,14 +105,7 @@ func (c *{{.RootStructName}}) GetString(path string) string {
 	if c.ConfigTree == nil {
 		return ""
 	}
-	node := c.ConfigTree.Get(path)
-	if node == nil || node.Type != tree.TypeString || !node.HasValue() {
-		return ""
-	}
-	if v, ok := node.GetValue().(string); ok {
-		return v
-	}
-	return ""
+	return c.ConfigTree.GetString(path)
 }
 
 // GetInt 动态查询整数值
@@ -105,14 +113,7 @@ func (c *{{.RootStructName}}) GetInt(path string) int {
 	if c.ConfigTree == nil {
 		return 0
 	}
-	node := c.ConfigTree.Get(path)
-	if node == nil || node.Type != tree.TypeInt || !node.HasValue() {
-		return 0
-	}
-	if v, ok := node.GetValue().(int); ok {
-		return v
-	}
-	return 0
+	return c.ConfigTree.GetInt(path)
 }
 
 // GetBool 动态查询布尔值
@@ -120,14 +121,7 @@ func (c *{{.RootStructName}}) GetBool(path string) bool {
 	if c.ConfigTree == nil {
 		return false
 	}
-	node := c.ConfigTree.Get(path)
-	if node == nil || node.Type != tree.TypeBool || !node.HasValue() {
-		return false
-	}
-	if v, ok := node.GetValue().(bool); ok {
-		return v
-	}
-	return false
+	return c.ConfigTree.GetBool(path)
 }
 
 // GetFloat 动态查询浮点数值
@@ -135,14 +129,7 @@ func (c *{{.RootStructName}}) GetFloat(path string) float64 {
 	if c.ConfigTree == nil {
 		return 0
 	}
-	node := c.ConfigTree.Get(path)
-	if node == nil || node.Type != tree.TypeFloat || !node.HasValue() {
-		return 0
-	}
-	if v, ok := node.GetValue().(float64); ok {
-		return v
-	}
-	return 0
+	return c.ConfigTree.GetFloat(path)
 }
 
 // Get 动态查询配置值（返回 interface{}）
@@ -150,11 +137,7 @@ func (c *{{.RootStructName}}) Get(path string) interface{} {
 	if c.ConfigTree == nil {
 		return nil
 	}
-	node := c.ConfigTree.Get(path)
-	if node == nil || !node.HasValue() {
-		return nil
-	}
-	return node.GetValue()
+	return c.ConfigTree.Get(path)
 }
 `
 

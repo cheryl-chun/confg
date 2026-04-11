@@ -133,7 +133,7 @@ func (g *Generator) writeStructWithTree(def *analyzer.StructDef, includeTree boo
 		if len("ConfigTree") > maxNameLen {
 			maxNameLen = len("ConfigTree")
 		}
-		treeType := "*tree.ConfigTree"
+		treeType := "*runtime.Tree"
 		if len(treeType) > maxTypeLen {
 			maxTypeLen = len(treeType)
 		}
@@ -151,7 +151,7 @@ func (g *Generator) writeStructWithTree(def *analyzer.StructDef, includeTree boo
 		g.buf.WriteString("\tConfigTree")
 		padding := maxNameLen - len("ConfigTree") + 1
 		g.buf.WriteString(strings.Repeat(" ", padding))
-		g.buf.WriteString("*tree.ConfigTree")
+		g.buf.WriteString("*runtime.Tree")
 		g.buf.WriteString("\n")
 	}
 

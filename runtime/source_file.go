@@ -14,23 +14,25 @@ type FileSource struct {
 
 // Load 实现 Source 接口
 func (s *FileSource) Load(configTree *tree.ConfigTree) error {
-	// 使用 parser.ParseToTree 解析文件
-	tempTree, err := parser.ParseToTree(s.Path, tree.SourceFile)
+	tempTree, err := s.parseTree()
 	if err != nil {
-		return fmt.Errorf("failed to parse file %s: %w", s.Path, err)
+		return err
 	}
-
-	// 将解析的 tree 合并到目标 tree
-	// TODO: 实现更高效的合并方法
-	// 目前简单实现：直接返回解析的 tree
-	// 在多源配置时需要实现优先级合并
-
-	return s.mergeTrees(configTree, tempTree)
+	configTree.ReplaceSource(tempTree, tree.SourceFile)
+	return nil
 }
 
 // Priority 返回文件配置源的优先级
 func (s *FileSource) Priority() tree.SourceType {
 	return tree.SourceFile
+}
+
+func (s *FileSource) parseTree() (*tree.ConfigTree, error) {
+	tempTree, err := parser.ParseToTree(s.Path, tree.SourceFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse file %s: %w", s.Path, err)
+	}
+	return tempTree, nil
 }
 
 // mergeTrees 将 src tree 合并到 dst tree

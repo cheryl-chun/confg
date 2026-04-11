@@ -2,6 +2,7 @@ package tree
 
 import (
 	"testing"
+	"time"
 )
 
 func TestConfigTree_SetAndGet(t *testing.T) {
@@ -219,13 +220,13 @@ func TestConfigTree_MultiSourcePriority(t *testing.T) {
 
 func TestConfigTree_Merge(t *testing.T) {
 	cases := []struct {
-		name             string
-		setupBaseTree    func() *ConfigTree
-		setupMergeTree   func() *ConfigTree
-		mergeSource      SourceType
-		checkPath        string
-		expectedValue    any
-		expectedSource   SourceType
+		name           string
+		setupBaseTree  func() *ConfigTree
+		setupMergeTree func() *ConfigTree
+		mergeSource    SourceType
+		checkPath      string
+		expectedValue  any
+		expectedSource SourceType
 	}{
 		{
 			name: "merge remote into file config",
@@ -479,10 +480,10 @@ func TestConfigTree_ComplexScenario(t *testing.T) {
 		expectedValue any
 		expectedSrc   SourceType
 	}{
-		{"server.host", "prod.example.com", SourceSystemEnv},        // Env wins
-		{"server.port", 8080, SourceDefault},                        // Only default set
-		{"server.timeout", 30, SourceFile},                          // File > Remote
-		{"debug", false, SourceCodeOverride},                        // Code override wins
+		{"server.host", "prod.example.com", SourceSystemEnv}, // Env wins
+		{"server.port", 8080, SourceDefault},                 // Only default set
+		{"server.timeout", 30, SourceFile},                   // File > Remote
+		{"debug", false, SourceCodeOverride},                 // Code override wins
 	}
 
 	for _, tc := range cases {
@@ -555,5 +556,151 @@ func TestConfigTree_SetByPath(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestConfigTree_Watch_TriggersOnValueChange(t *testing.T) {
+	configTree := NewConfigTree()
+	defer configTree.Close()
+
+	events := make(chan WatchEvent, 4)
+	configTree.Watch("server.host", func(event WatchEvent) {
+		events <- event
+	})
+
+	if err := configTree.Set("server.host", "localhost", SourceFile, TypeString); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+
+	first := waitEvent(t, events)
+	if first.OldValue != nil || first.NewValue != "localhost" {
+		t.Fatalf("first event = %#v, want old=nil new=localhost", first)
+	}
+
+	if err := configTree.Set("server.host", "127.0.0.1", SourceFile, TypeString); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+
+	second := waitEvent(t, events)
+	if second.OldValue != "localhost" || second.NewValue != "127.0.0.1" {
+		t.Fatalf("second event = %#v, want old=localhost new=127.0.0.1", second)
+	}
+}
+
+func TestConfigTree_Watch_NoEventWhenEffectiveValueUnchanged(t *testing.T) {
+	configTree := NewConfigTree()
+	defer configTree.Close()
+
+	events := make(chan WatchEvent, 4)
+	configTree.Watch("server.host", func(event WatchEvent) {
+		events <- event
+	})
+
+	if err := configTree.Set("server.host", "localhost", SourceFile, TypeString); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	_ = waitEvent(t, events)
+
+	// Same value from same source should not trigger.
+	if err := configTree.Set("server.host", "localhost", SourceFile, TypeString); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	assertNoEvent(t, events)
+
+	// Lower priority source should not change effective value.
+	if err := configTree.Set("server.host", "default-host", SourceDefault, TypeString); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	assertNoEvent(t, events)
+}
+
+func TestConfigTree_Watch_Unsubscribe(t *testing.T) {
+	configTree := NewConfigTree()
+	defer configTree.Close()
+
+	events := make(chan WatchEvent, 2)
+	unwatch := configTree.Watch("debug", func(event WatchEvent) {
+		events <- event
+	})
+
+	if err := configTree.Set("debug", true, SourceFile, TypeBool); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	_ = waitEvent(t, events)
+
+	unwatch()
+
+	if err := configTree.Set("debug", false, SourceFile, TypeBool); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	assertNoEvent(t, events)
+}
+
+func waitEvent(t *testing.T, events <-chan WatchEvent) WatchEvent {
+	t.Helper()
+
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("timed out waiting for watch event")
+		return WatchEvent{}
+	}
+}
+
+func assertNoEvent(t *testing.T, events <-chan WatchEvent) {
+	t.Helper()
+
+	select {
+	case event := <-events:
+		t.Fatalf("unexpected event: %#v", event)
+	case <-time.After(120 * time.Millisecond):
+	}
+}
+
+func TestConfigTree_ReplaceSource(t *testing.T) {
+	configTree := NewConfigTree()
+	defer configTree.Close()
+
+	if err := configTree.Set("server.host", "localhost", SourceFile, TypeString); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	if err := configTree.Set("server.port", 8080, SourceFile, TypeInt); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	if err := configTree.Set("server.host", "env.example.com", SourceSystemEnv, TypeString); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+
+	snapshot := NewConfigTree()
+	defer snapshot.Close()
+	if err := snapshot.Set("server.host", "reloaded.local", SourceFile, TypeString); err != nil {
+		t.Fatalf("snapshot Set() error = %v", err)
+	}
+	if err := snapshot.Set("server.timeout", 30, SourceFile, TypeInt); err != nil {
+		t.Fatalf("snapshot Set() error = %v", err)
+	}
+
+	configTree.ReplaceSource(snapshot, SourceFile)
+
+	host, ok := configTree.GetValue("server.host")
+	if !ok || host != "env.example.com" {
+		t.Fatalf("server.host = %v, want env.example.com", host)
+	}
+
+	timeout, ok := configTree.GetValue("server.timeout")
+	if !ok || timeout != 30 {
+		t.Fatalf("server.timeout = %v, want 30", timeout)
+	}
+
+	portNode := configTree.Get("server.port")
+	if portNode == nil {
+		t.Fatal("server.port node should still exist")
+	}
+	if _, ok := portNode.GetValueFromSource(SourceFile); ok {
+		t.Fatal("server.port file source value should be removed after replace")
+	}
+	if _, ok := configTree.GetValue("server.port"); ok {
+		t.Fatal("server.port should no longer have effective value")
 	}
 }

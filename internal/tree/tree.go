@@ -2,19 +2,146 @@ package tree
 
 import (
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // ConfigTree is a Trie tree structure for configuration data
 type ConfigTree struct {
 	Root *ConfigNode
+
+	mu            sync.RWMutex
+	watchers      map[string]map[uint64]WatchCallback
+	nextWatcherID uint64
+	events        chan WatchEvent
+	closeOnce     sync.Once
+	closed        chan struct{}
+	wg            sync.WaitGroup
+}
+
+// WatchEvent is emitted when the effective value of a path changes.
+type WatchEvent struct {
+	Path      string
+	OldValue  any
+	NewValue  any
+	Source    SourceType
+	ValueType ValueType
+	Time      time.Time
+}
+
+// WatchCallback handles tree change events.
+type WatchCallback func(event WatchEvent)
+
+type sourceSnapshotEntry struct {
+	value     any
+	valueType ValueType
 }
 
 func NewConfigTree() *ConfigTree {
 	root := NewConfigNode("root")
 	root.Type = TypeObject // Root is always an object
-	return &ConfigTree{
-		Root: root,
+	t := &ConfigTree{
+		Root:     root,
+		watchers: make(map[string]map[uint64]WatchCallback),
+		events:   make(chan WatchEvent, 128),
+		closed:   make(chan struct{}),
+	}
+	t.wg.Add(1)
+	go t.runEventLoop()
+	return t
+}
+
+// Close stops the internal watch dispatcher.
+func (t *ConfigTree) Close() {
+	t.closeOnce.Do(func() {
+		close(t.closed)
+		t.wg.Wait()
+	})
+}
+
+// Watch registers a callback on an exact path and returns an unsubscribe function.
+func (t *ConfigTree) Watch(path string, callback WatchCallback) func() {
+	if path == "" || callback == nil {
+		return func() {}
+	}
+
+	id := atomic.AddUint64(&t.nextWatcherID, 1)
+
+	t.mu.Lock()
+	if _, ok := t.watchers[path]; !ok {
+		t.watchers[path] = make(map[uint64]WatchCallback)
+	}
+	t.watchers[path][id] = callback
+	t.mu.Unlock()
+
+	return func() {
+		t.unwatch(path, id)
+	}
+}
+
+func (t *ConfigTree) unwatch(path string, id uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	watchersByPath, ok := t.watchers[path]
+	if !ok {
+		return
+	}
+
+	delete(watchersByPath, id)
+	if len(watchersByPath) == 0 {
+		delete(t.watchers, path)
+	}
+}
+
+func (t *ConfigTree) runEventLoop() {
+	defer t.wg.Done()
+
+	for {
+		select {
+		case <-t.closed:
+			return
+		case event := <-t.events:
+			t.dispatchEvent(event)
+		}
+	}
+}
+
+func (t *ConfigTree) dispatchEvent(event WatchEvent) {
+	t.mu.RLock()
+	watchersByPath := t.watchers[event.Path]
+	callbacks := make([]WatchCallback, 0, len(watchersByPath))
+	for _, cb := range watchersByPath {
+		callbacks = append(callbacks, cb)
+	}
+	t.mu.RUnlock()
+
+	for _, cb := range callbacks {
+		cb(event)
+	}
+}
+
+func (t *ConfigTree) emitEvent(event WatchEvent) {
+	select {
+	case <-t.closed:
+		return
+	default:
+	}
+
+	select {
+	case t.events <- event:
+		return
+	default:
+		go func() {
+			select {
+			case <-t.closed:
+			case t.events <- event:
+			}
+		}()
 	}
 }
 
@@ -24,12 +151,23 @@ func (t *ConfigTree) Get(path string) *ConfigNode {
 	if path == "" {
 		return nil
 	}
-	return t.GetByPath(strings.Split(path, "."))
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	return t.getByPathUnlocked(strings.Split(path, "."))
 }
 
 // GetByPath gets the node by path
 // path format: []string{"server", "host"}
 func (t *ConfigTree) GetByPath(path []string) *ConfigNode {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	return t.getByPathUnlocked(path)
+}
+
+func (t *ConfigTree) getByPathUnlocked(path []string) *ConfigNode {
 	node := t.Root
 	for _, key := range path {
 		if key == "" {
@@ -45,9 +183,34 @@ func (t *ConfigTree) GetByPath(path []string) *ConfigNode {
 	return node
 }
 
+func (t *ConfigTree) getOrCreateNodeLocked(path []string, valueType ValueType) *ConfigNode {
+	node := t.Root
+	for i, key := range path {
+		if key == "" {
+			continue
+		}
+
+		child, ok := node.GetChild(key)
+		if !ok {
+			child = NewConfigNode(key)
+			if i == len(path)-1 {
+				child.Type = valueType
+			} else {
+				child.Type = TypeObject
+			}
+			node.AddChild(child)
+		}
+		node = child
+	}
+	return node
+}
+
 // GetValue gets the value of the node by path
 func (t *ConfigTree) GetValue(path string) (any, bool) {
-	node := t.Get(path)
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	node := t.getByPathUnlocked(strings.Split(path, "."))
 	if node == nil || !node.HasValue() {
 		return nil, false
 	}
@@ -66,6 +229,8 @@ func (t *ConfigTree) SetByPath(path []string, value any, source SourceType, valu
 		return fmt.Errorf("path cannot be empty")
 	}
 
+	t.mu.Lock()
+
 	// Traverse the path and create missing nodes
 	node := t.Root
 	for i, key := range path {
@@ -77,7 +242,7 @@ func (t *ConfigTree) SetByPath(path []string, value any, source SourceType, valu
 		if !ok {
 			child = NewConfigNode(key)
 
-			// if child is the last key, set it to the actual type; 
+			// if child is the last key, set it to the actual type;
 			// otherwise, set it to object
 			if i == len(path)-1 {
 				child.Type = valueType
@@ -90,14 +255,117 @@ func (t *ConfigTree) SetByPath(path []string, value any, source SourceType, valu
 		node = child
 	}
 
+	var oldValue any
+	oldExists := node.HasValue()
+	if oldExists {
+		oldValue = node.GetValue()
+	}
+
 	node.SetValue(value, source)
+	newValue := node.GetValue()
+	newExists := node.HasValue()
+	pathStr := strings.Join(path, ".")
+	normalizedPath := strings.Trim(pathStr, ".")
+	changed := oldExists != newExists || !reflect.DeepEqual(oldValue, newValue)
+	t.mu.Unlock()
+
+	if changed && normalizedPath != "" {
+		t.emitEvent(WatchEvent{
+			Path:      normalizedPath,
+			OldValue:  oldValue,
+			NewValue:  newValue,
+			Source:    source,
+			ValueType: valueType,
+			Time:      time.Now(),
+		})
+	}
+
 	return nil
 }
 
 // Merge is used to merge another ConfigTree into this one
 // with a specified source type for the new values
 func (t *ConfigTree) Merge(other *ConfigTree, source SourceType) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	t.mergeNode(t.Root, other.Root, source)
+}
+
+// ReplaceSource replaces all values from the specified source with values from snapshot.
+// Values from other sources are preserved, and only effective value changes emit watch events.
+func (t *ConfigTree) ReplaceSource(snapshot *ConfigTree, source SourceType) {
+	var newSnapshot map[string]sourceSnapshotEntry
+	if snapshot != nil {
+		newSnapshot = snapshot.collectSourceSnapshot(source)
+	} else {
+		newSnapshot = make(map[string]sourceSnapshotEntry)
+	}
+
+	t.mu.Lock()
+	currentSnapshot := t.collectSourceSnapshotLocked(source)
+	allPaths := make(map[string]struct{}, len(currentSnapshot)+len(newSnapshot))
+	for path := range currentSnapshot {
+		allPaths[path] = struct{}{}
+	}
+	for path := range newSnapshot {
+		allPaths[path] = struct{}{}
+	}
+
+	paths := make([]string, 0, len(allPaths))
+	for path := range allPaths {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	events := make([]WatchEvent, 0, len(paths))
+	for _, path := range paths {
+		segments := strings.Split(path, ".")
+		node := t.getByPathUnlocked(segments)
+
+		var oldValue any
+		oldExists := false
+		if node != nil && node.HasValue() {
+			oldValue = node.GetValue()
+			oldExists = true
+		}
+
+		if entry, ok := newSnapshot[path]; ok {
+			node = t.getOrCreateNodeLocked(segments, entry.valueType)
+			node.Type = entry.valueType
+			node.SetValue(entry.value, source)
+		} else if node != nil {
+			node.RemoveSource(source)
+		}
+
+		node = t.getByPathUnlocked(segments)
+		var newValue any
+		newExists := false
+		valueType := TypeNull
+		if node != nil {
+			valueType = node.Type
+			if node.HasValue() {
+				newValue = node.GetValue()
+				newExists = true
+			}
+		}
+
+		if oldExists != newExists || !reflect.DeepEqual(oldValue, newValue) {
+			events = append(events, WatchEvent{
+				Path:      path,
+				OldValue:  oldValue,
+				NewValue:  newValue,
+				Source:    source,
+				ValueType: valueType,
+				Time:      time.Now(),
+			})
+		}
+	}
+	t.mu.Unlock()
+
+	for _, event := range events {
+		t.emitEvent(event)
+	}
 }
 
 func (t *ConfigTree) mergeNode(target, source *ConfigNode, sourceType SourceType) {
@@ -148,9 +416,44 @@ func copyNode(source *ConfigNode, sourceType SourceType) *ConfigNode {
 	return node
 }
 
+func (t *ConfigTree) collectSourceSnapshot(source SourceType) map[string]sourceSnapshotEntry {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.collectSourceSnapshotLocked(source)
+}
+
+func (t *ConfigTree) collectSourceSnapshotLocked(source SourceType) map[string]sourceSnapshotEntry {
+	result := make(map[string]sourceSnapshotEntry)
+	t.collectSourceSnapshotFromNodeLocked(t.Root, "", source, result)
+	return result
+}
+
+func (t *ConfigTree) collectSourceSnapshotFromNodeLocked(node *ConfigNode, path string, source SourceType, result map[string]sourceSnapshotEntry) {
+	if node == nil {
+		return
+	}
+
+	if path != "" {
+		if value, ok := node.GetValueFromSource(source); ok {
+			result[path] = sourceSnapshotEntry{value: value, valueType: node.Type}
+		}
+	}
+
+	for key, child := range node.Children {
+		childPath := key
+		if path != "" {
+			childPath = path + "." + key
+		}
+		t.collectSourceSnapshotFromNodeLocked(child, childPath, source, result)
+	}
+}
+
 // GetAllWithPrefix gets all nodes with the specified prefix
 func (t *ConfigTree) GetAllWithPrefix(prefix string) map[string]*ConfigNode {
-	node := t.Get(prefix)
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	node := t.getByPathUnlocked(strings.Split(prefix, "."))
 	if node == nil {
 		return nil
 	}
@@ -165,6 +468,9 @@ func (t *ConfigTree) GetAllWithPrefix(prefix string) map[string]*ConfigNode {
 
 // Walk traverses the entire tree
 func (t *ConfigTree) Walk(fn func(path string, node *ConfigNode)) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
 	t.walkNode(t.Root, "", fn)
 }
 
@@ -187,6 +493,9 @@ func (t *ConfigTree) walkNode(node *ConfigNode, path string, fn func(string, *Co
 // ToMap converts the tree to a nested map (for serialization)
 // Only returns the highest priority values
 func (t *ConfigTree) ToMap() map[string]any {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
 	return t.nodeToMap(t.Root)
 }
 
@@ -228,6 +537,9 @@ func (t *ConfigTree) nodeToArray(node *ConfigNode) []any {
 }
 
 func (t *ConfigTree) Print() {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
 	t.printNode(t.Root, "", true)
 }
 

@@ -1,6 +1,8 @@
 package parser
 
 import (
+	"strconv"
+
 	"github.com/cheryl-chun/confgen/internal/tree"
 )
 
@@ -12,8 +14,9 @@ import (
 // 3. Set the source type for all values
 //
 // Example:
-//   configTree, err := parser.ParseToTree("config.yaml", tree.SourceFile)
-//   value, _ := configTree.GetValue("server.host")
+//
+//	configTree, err := parser.ParseToTree("config.yaml", tree.SourceFile)
+//	value, _ := configTree.GetValue("server.host")
 func ParseToTree(path string, source tree.SourceType) (*tree.ConfigTree, error) {
 	// Step 1: Parse the file using the factory
 	factory := GetFactory()
@@ -73,14 +76,17 @@ func convertToTree(configTree *tree.ConfigTree, parentPath string, node *ConfigN
 
 	case node.IsArray():
 		// Array node: process each item
-		// Note: Arrays are more complex because we need to handle object arrays vs primitive arrays
-		// For now, we store the entire array as a single value
-		// TODO: Support array element access like "servers[0].host"
+		// We keep the full array value, and also flatten items into index paths
+		// such as "features.0" and "servers.0.host" for fast indexed lookup.
 
 		// Extract array values
 		arrayValues := make([]any, len(node.Items))
 		for i, item := range node.Items {
 			arrayValues[i] = extractValue(item)
+			if parentPath != "" {
+				indexPath := parentPath + "." + strconv.Itoa(i)
+				convertArrayItemToTree(configTree, indexPath, item, source)
+			}
 		}
 
 		// Set the array in the tree
@@ -96,6 +102,37 @@ func convertToTree(configTree *tree.ConfigTree, parentPath string, node *ConfigN
 			treeType := convertValueType(node.Type)
 			configTree.Set(parentPath, node.Value, source, treeType)
 		}
+	}
+}
+
+// convertArrayItemToTree flattens an array element to indexed paths.
+// Example:
+// - primitive: features.0 = "ssl"
+// - object: servers.0.host = "server1.com"
+// - nested array: matrix.0.1 = 42
+func convertArrayItemToTree(configTree *tree.ConfigTree, indexPath string, node *ConfigNode, source tree.SourceType) {
+	if node == nil || indexPath == "" {
+		return
+	}
+
+	switch {
+	case node.IsPrimitive():
+		configTree.Set(indexPath, node.Value, source, convertValueType(node.Type))
+
+	case node.IsObject():
+		for key, child := range node.Children {
+			childPath := indexPath + "." + key
+			convertToTree(configTree, childPath, child, source)
+		}
+
+	case node.IsArray():
+		nestedValues := make([]any, len(node.Items))
+		for i, item := range node.Items {
+			nestedValues[i] = extractValue(item)
+			nestedPath := indexPath + "." + strconv.Itoa(i)
+			convertArrayItemToTree(configTree, nestedPath, item, source)
+		}
+		configTree.Set(indexPath, nestedValues, source, tree.TypeArray)
 	}
 }
 

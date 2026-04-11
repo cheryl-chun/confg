@@ -1,0 +1,13 @@
+app:
+  name: "my-service"
+  log_level: "info"
+  debug: false
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  timeout_seconds: 30
+
+feature:
+  enable_cache: true
+  max_cache_size: 512

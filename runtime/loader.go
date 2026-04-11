@@ -53,18 +53,9 @@ func (l *Loader) AddEnv(prefix string) *Loader {
 // 2. 使用反射将 tree 的值填充到 struct 字段
 // 3. 将 tree 设置到 struct 的 ConfigTree 字段（如果存在）
 func (l *Loader) Fill(cfg interface{}) error {
-	// 1. 验证参数
-	if cfg == nil {
-		return fmt.Errorf("config cannot be nil")
-	}
-
-	rv := reflect.ValueOf(cfg)
-	if rv.Kind() != reflect.Ptr {
-		return fmt.Errorf("config must be a pointer")
-	}
-
-	if rv.IsNil() {
-		return fmt.Errorf("config pointer is nil")
+	_, err := l.validateConfigTarget(cfg)
+	if err != nil {
+		return err
 	}
 
 	// 2. 加载所有配置源到 tree
@@ -74,8 +65,35 @@ func (l *Loader) Fill(cfg interface{}) error {
 		}
 	}
 
+	return l.applyTreeToConfig(cfg)
+}
+
+func (l *Loader) validateConfigTarget(cfg interface{}) (reflect.Value, error) {
+	if cfg == nil {
+		return reflect.Value{}, fmt.Errorf("config cannot be nil")
+	}
+
+	rv := reflect.ValueOf(cfg)
+	if rv.Kind() != reflect.Ptr {
+		return reflect.Value{}, fmt.Errorf("config must be a pointer")
+	}
+
+	if rv.IsNil() {
+		return reflect.Value{}, fmt.Errorf("config pointer is nil")
+	}
+
+	return rv, nil
+}
+
+func (l *Loader) applyTreeToConfig(cfg interface{}) error {
+	rv, err := l.validateConfigTarget(cfg)
+	if err != nil {
+		return err
+	}
+
 	// 3. 反射填充 struct
 	elem := rv.Elem()
+	elem.Set(reflect.Zero(elem.Type()))
 	if err := l.fillStruct(elem, ""); err != nil {
 		return fmt.Errorf("failed to fill struct: %w", err)
 	}
@@ -226,10 +244,59 @@ func (l *Loader) setReflectValue(v reflect.Value, val interface{}, t reflect.Typ
 		if b, ok := val.(bool); ok {
 			v.SetBool(b)
 		}
+	case reflect.Slice:
+		arr, ok := val.([]interface{})
+		if !ok {
+			return nil
+		}
+
+		elemType := t.Elem()
+		slice := reflect.MakeSlice(t, len(arr), len(arr))
+		for i, item := range arr {
+			if err := l.setReflectValue(slice.Index(i), item, elemType); err != nil {
+				return err
+			}
+		}
+		v.Set(slice)
 	case reflect.Struct:
-		// TODO: 支持对象数组
+		obj, ok := val.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+
+		for i := 0; i < v.NumField(); i++ {
+			field := v.Field(i)
+			fieldType := t.Field(i)
+
+			if !field.CanSet() || fieldType.Name == "ConfigTree" {
+				continue
+			}
+
+			mapKey := l.getMapKey(fieldType)
+			raw, exists := obj[mapKey]
+			if !exists {
+				continue
+			}
+
+			if err := l.setReflectValue(field, raw, fieldType.Type); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+// getMapKey picks the lookup key for map values based on struct tags.
+func (l *Loader) getMapKey(field reflect.StructField) string {
+	if tag := field.Tag.Get("json"); tag != "" && tag != "-" {
+		return tag
+	}
+
+	if tag := field.Tag.Get("yaml"); tag != "" && tag != "-" {
+		return tag
+	}
+
+	return field.Name
 }
 
 // getFieldPath 获取字段的配置路径
@@ -269,9 +336,21 @@ func (l *Loader) setConfigTreeField(v reflect.Value) error {
 		return fmt.Errorf("ConfigTree field cannot be set")
 	}
 
-	// 设置 tree 指针
-	treeField.Set(reflect.ValueOf(l.tree))
-	return nil
+	internalTreeType := reflect.TypeOf((*tree.ConfigTree)(nil))
+	publicTreeType := reflect.TypeOf((*Tree)(nil))
+
+	// Backward compatibility for old generated code.
+	if treeField.Type() == internalTreeType {
+		treeField.Set(reflect.ValueOf(l.tree))
+		return nil
+	}
+
+	if treeField.Type() == publicTreeType {
+		treeField.Set(reflect.ValueOf(wrapTree(l.tree)))
+		return nil
+	}
+
+	return fmt.Errorf("ConfigTree field has unsupported type: %s", treeField.Type())
 }
 
 // GetTree 获取内部的 ConfigTree
